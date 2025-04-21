@@ -13,7 +13,8 @@
 #define SEPARATOR_ROW_OFFSET -3
 #define USER_ROW_OFFSET -2
 #define PROMPT_ROW_OFFSET 0
-#define ERROR_ROW_OFFSET 3
+#define ERROR_ROW_OFFSET 5
+#define KEYBINDS_ROW_OFFSET 7
 #define PROMPT_COL_FACTOR 0.25
 #define MAX_PASSWORD_LEN 30
 #define ERROR_TIMEOUT 2
@@ -33,7 +34,8 @@ static volatile int resized = 0;
 
 // Signal handlers
 void handle_sigint(int sig) {
-    running = 0;
+    endwin(); // Restore terminal state
+    exit(0);  // Exit immediately
 }
 
 void handle_sigwinch(int sig) {
@@ -153,6 +155,8 @@ void draw_ui(WINDOW *win, int rows, int cols, Config *users, int num_users,
         }
         wattroff(win, A_REVERSE);
 
+        print_centered(win, rows/2 + KEYBINDS_ROW_OFFSET, cols, "Ctrl+C: Close, Esc 2x: Change User", 0);
+
         wmove(win, rows/2 + PROMPT_ROW_OFFSET, prompt_col + strlen("password: ") + input_pos);
     }
 
@@ -166,7 +170,9 @@ void draw_ui(WINDOW *win, int rows, int cols, Config *users, int num_users,
 // Handle input, with proper error message timing
 int handle_input(WINDOW *win, int rows, int cols, Config *users, int num_users,
                  int *selected_user, int *mode, char *input, int *pos, char *error_msg,
-                 time_t *error_start) { // Changed: Added error_start
+                 time_t *error_start) {
+    static int esc_count = 0;
+    static time_t last_esc_time = 0;
     int prompt_col = cols * PROMPT_COL_FACTOR + strlen("password: ");
     int ch = getch();
 
@@ -183,19 +189,36 @@ int handle_input(WINDOW *win, int rows, int cols, Config *users, int num_users,
             *mode = PASSWORD_MODE;
             input[0] = '\0';
             *pos = 0;
+            esc_count = 0;
             draw_ui(win, rows, cols, users, num_users, *selected_user, *mode, error_msg, *pos);
             return 0;
         } else if (ch == 27) {
-            return 2;
+            *mode = PASSWORD_MODE;
+            input[0] = '\0';
+            *pos = 0;
+            esc_count = 0;
+            draw_ui(win, rows, cols, users, num_users, *selected_user, *mode, error_msg, *pos);
+            return 0;
         }
     } else {
         if (ch == 27) {
-            *mode = SELECTION_MODE;
-            input[0] = '\0';
-            *pos = 0;
-            error_msg[0] = '\0';
-            *error_start = 0; // New: Reset error_start
-            draw_ui(win, rows, cols, users, num_users, *selected_user, *mode, error_msg, *pos);
+            time_t current_time = time(NULL);
+            if (current_time - last_esc_time <= 1) {
+                esc_count++;
+            } else {
+                esc_count = 1;
+            }
+            last_esc_time = current_time;
+
+            if (esc_count >= 2) {
+                *mode = SELECTION_MODE;
+                input[0] = '\0';
+                *pos = 0;
+                error_msg[0] = '\0';
+                *error_start = 0;
+                esc_count = 0;
+                draw_ui(win, rows, cols, users, num_users, *selected_user, *mode, error_msg, *pos);
+            }
             return 0;
         } else if (ch == '\n') {
             if (!strcmp(input, users[*selected_user].pwd)) {
@@ -204,13 +227,15 @@ int handle_input(WINDOW *win, int rows, int cols, Config *users, int num_users,
             strcpy(error_msg, "Incorrect password");
             input[0] = '\0';
             *pos = 0;
-            *error_start = time(NULL); // New: Set error_start for timeout
+            *error_start = time(NULL);
+            esc_count = 0;
             draw_ui(win, rows, cols, users, num_users, *selected_user, *mode, error_msg, *pos);
         } else if ((ch == KEY_BACKSPACE || ch == 127 || ch == 8) && *pos > 0) {
             input[--(*pos)] = '\0';
             mvwaddch(win, rows/2 + PROMPT_ROW_OFFSET, prompt_col + *pos, ' ');
             wmove(win, rows/2 + PROMPT_ROW_OFFSET, prompt_col + *pos);
             wrefresh(win);
+            esc_count = 0;
         } else if (ch >= ' ' && ch <= '~' && *pos < MAX_PASSWORD_LEN) {
             input[(*pos)++] = ch;
             input[*pos] = '\0';
@@ -219,6 +244,7 @@ int handle_input(WINDOW *win, int rows, int cols, Config *users, int num_users,
             wattroff(win, A_REVERSE);
             wmove(win, rows/2 + PROMPT_ROW_OFFSET, prompt_col + *pos);
             wrefresh(win);
+            esc_count = 0;
         } else {
             return 0;
         }
@@ -269,7 +295,7 @@ int main() {
     signal(SIGWINCH, handle_sigwinch);
 
     char error_msg[256] = "";
-    time_t error_start = 0; // Moved: Declared here for handle_input
+    time_t error_start = 0;
     if (read_dmrc(&users, &num_users) != 0) {
         num_users = 1;
         users = malloc(sizeof(Config));
@@ -277,18 +303,18 @@ int main() {
         strcpy(users[0].pwd, "");
         strcpy(users[0].cmd, "true");
         strcpy(error_msg, "No ~/.dmrc found, using defaults");
-        error_start = time(NULL); // New: Set for initial error
-        draw_ui(win, win_rows, win_cols, users, num_users, 0, num_users == 1 ? PASSWORD_MODE : SELECTION_MODE, error_msg, 0);
+        error_start = time(NULL);
+        draw_ui(win, win_rows, win_cols, users, num_users, 0, PASSWORD_MODE, error_msg, 0);
         sleep(3);
         error_msg[0] = '\0';
-        error_start = 0; // New: Reset
+        error_start = 0;
     }
 
     for (int i = 0; i < num_users; i++) {
         if (!users[i].username[0] || !users[i].cmd[0]) {
             strcpy(error_msg, "Invalid .dmrc: missing username or cmd");
-            error_start = time(NULL); // New: Set for initial error
-            draw_ui(win, win_rows, win_cols, users, num_users, 0, num_users == 1 ? PASSWORD_MODE : SELECTION_MODE, error_msg, 0);
+            error_start = time(NULL);
+            draw_ui(win, win_rows, win_cols, users, num_users, 0, PASSWORD_MODE, error_msg, 0);
             sleep(3);
             free_users(&users, &num_users);
             num_users = 1;
@@ -297,7 +323,7 @@ int main() {
             strcpy(users[0].pwd, "");
             strcpy(users[0].cmd, "true");
             error_msg[0] = '\0';
-            error_start = 0; // New: Reset
+            error_start = 0;
             break;
         }
     }
@@ -305,7 +331,7 @@ int main() {
     char input[MAX_PASSWORD_LEN + 1] = "";
     int pos = 0;
     int selected_user = 0;
-    int mode = num_users == 1 ? PASSWORD_MODE : SELECTION_MODE;
+    int mode = PASSWORD_MODE;
 
     draw_ui(win, win_rows, win_cols, users, num_users, selected_user, mode, error_msg, pos);
     usleep(100000);
@@ -336,12 +362,12 @@ int main() {
 
         if (error_msg[0] && time(NULL) - error_start >= ERROR_TIMEOUT) {
             error_msg[0] = '\0';
-            error_start = 0; // New: Reset
+            error_start = 0;
             draw_ui(win, win_rows, win_cols, users, num_users, selected_user, mode, error_msg, pos);
         }
 
         int action = handle_input(win, win_rows, win_cols, users, num_users,
-                                 &selected_user, &mode, input, &pos, error_msg, &error_start); // Changed: Pass error_start
+                                 &selected_user, &mode, input, &pos, error_msg, &error_start);
         if (action == 1) {
             wclear(win);
             wrefresh(win);
@@ -376,21 +402,16 @@ int main() {
                     strcpy(users[0].cmd, "true");
                 }
                 strcpy(error_msg, "Command failed, retrying login");
-                error_start = time(NULL); // New: Set for command failure
+                error_start = time(NULL);
                 input[0] = '\0';
                 pos = 0;
                 selected_user = 0;
-                mode = num_users == 1 ? PASSWORD_MODE : SELECTION_MODE;
+                mode = PASSWORD_MODE;
                 draw_ui(win, win_rows, win_cols, users, num_users, selected_user, mode, error_msg, pos);
                 continue;
             }
             return 0;
-        } else if (action == 2) {
-            break;
         }
-
-        // Changed: Removed redundant error_start setting block
-        // No need to set error_start here; handled in handle_input or initial errors
     }
 
     wclear(win);
